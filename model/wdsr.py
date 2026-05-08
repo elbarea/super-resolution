@@ -44,10 +44,12 @@ def res_block_a(x_in, num_filters, expansion, kernel_size, scaling):
     return x
 
 
+_WDSR_B_LINEAR_RATIO = 0.8  # linear projection ratio in WDSR-B residual block
+
+
 def res_block_b(x_in, num_filters, expansion, kernel_size, scaling):
-    linear = 0.8
     x = conv2d_weightnorm(num_filters * expansion, 1, padding='same', activation='relu')(x_in)
-    x = conv2d_weightnorm(int(num_filters * linear), 1, padding='same')(x)
+    x = conv2d_weightnorm(int(num_filters * _WDSR_B_LINEAR_RATIO), 1, padding='same')(x)
     x = conv2d_weightnorm(num_filters, kernel_size, padding='same')(x)
     if scaling:
         x = Lambda(lambda t: t * scaling)(x)

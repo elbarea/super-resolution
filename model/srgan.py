@@ -7,6 +7,9 @@ from model.common import pixel_shuffle, normalize_01, normalize_m11, denormalize
 LR_SIZE = 24
 HR_SIZE = 96
 
+_BN_MOMENTUM = 0.8
+_LEAKY_RELU_ALPHA = 0.2
+
 
 def upsample(x_in, num_filters):
     x = Conv2D(num_filters, kernel_size=3, padding='same')(x_in)
@@ -14,7 +17,7 @@ def upsample(x_in, num_filters):
     return PReLU(shared_axes=[1, 2])(x)
 
 
-def res_block(x_in, num_filters, momentum=0.8):
+def res_block(x_in, num_filters, momentum=_BN_MOMENTUM):
     x = Conv2D(num_filters, kernel_size=3, padding='same')(x_in)
     x = BatchNormalization(momentum=momentum)(x)
     x = PReLU(shared_axes=[1, 2])(x)
@@ -50,11 +53,11 @@ def sr_resnet(num_filters=64, num_res_blocks=16):
 generator = sr_resnet
 
 
-def discriminator_block(x_in, num_filters, strides=1, batchnorm=True, momentum=0.8):
+def discriminator_block(x_in, num_filters, strides=1, batchnorm=True, momentum=_BN_MOMENTUM):
     x = Conv2D(num_filters, kernel_size=3, strides=strides, padding='same')(x_in)
     if batchnorm:
         x = BatchNormalization(momentum=momentum)(x)
-    return LeakyReLU(alpha=0.2)(x)
+    return LeakyReLU(alpha=_LEAKY_RELU_ALPHA)(x)
 
 
 def discriminator(num_filters=64):
