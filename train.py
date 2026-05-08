@@ -1,7 +1,8 @@
+import logging
 import time
 import tensorflow as tf
 
-from model import evaluate
+from model import evaluate, evaluate_metrics
 from model import srgan
 
 from tensorflow.keras.applications.vgg19 import preprocess_input
@@ -11,6 +12,17 @@ from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.metrics import Mean
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import PiecewiseConstantDecay
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
+
+# SRGAN perceptual loss weights (SRGAN paper)
+_SRGAN_ADV_LOSS_WEIGHT = 0.001
+_VGG_FEATURE_SCALE = 12.75
 
 
 class Trainer:
@@ -49,17 +61,23 @@ class Trainer:
             step = ckpt.step.numpy()
 
             loss = self.train_step(lr, hr)
+
+            if tf.math.is_nan(loss):
+                logger.warning(f'NaN loss detected at step {step}. Stopping training.')
+                break
+
             loss_mean(loss)
 
             if step % evaluate_every == 0:
                 loss_value = loss_mean.result()
                 loss_mean.reset_states()
 
-                # Compute PSNR on validation dataset
-                psnr_value = self.evaluate(valid_dataset)
+                psnr_value, ssim_value = self.evaluate_metrics(valid_dataset)
 
                 duration = time.perf_counter() - self.now
-                print(f'{step}/{steps}: loss = {loss_value.numpy():.3f}, PSNR = {psnr_value.numpy():3f} ({duration:.2f}s)')
+                logger.info(f'{step}/{steps}: loss = {loss_value.numpy():.3f}, '
+                            f'PSNR = {psnr_value.numpy():.3f}, SSIM = {ssim_value.numpy():.4f} '
+                            f'({duration:.2f}s)')
 
                 if save_best_only and psnr_value <= ckpt.psnr:
                     self.now = time.perf_counter()
@@ -88,10 +106,13 @@ class Trainer:
     def evaluate(self, dataset):
         return evaluate(self.checkpoint.model, dataset)
 
+    def evaluate_metrics(self, dataset):
+        return evaluate_metrics(self.checkpoint.model, dataset)
+
     def restore(self):
         if self.checkpoint_manager.latest_checkpoint:
             self.checkpoint.restore(self.checkpoint_manager.latest_checkpoint)
-            print(f'Model restored from checkpoint at step {self.checkpoint.step.numpy()}.')
+            logger.info(f'Model restored from checkpoint at step {self.checkpoint.step.numpy()}.')
 
 
 class EdsrTrainer(Trainer):
@@ -128,14 +149,12 @@ class SrganGeneratorTrainer(Trainer):
 
 
 class SrganTrainer:
-    #
-    # TODO: model and optimizer checkpoints
-    #
     def __init__(self,
                  generator,
                  discriminator,
                  content_loss='VGG54',
-                 learning_rate=PiecewiseConstantDecay(boundaries=[100000], values=[1e-4, 1e-5])):
+                 learning_rate=PiecewiseConstantDecay(boundaries=[100000], values=[1e-4, 1e-5]),
+                 checkpoint_dir='.ckpt/srgan'):
 
         if content_loss == 'VGG22':
             self.vgg = srgan.vgg_22()
@@ -145,30 +164,59 @@ class SrganTrainer:
             raise ValueError("content_loss must be either 'VGG22' or 'VGG54'")
 
         self.content_loss = content_loss
-        self.generator = generator
-        self.discriminator = discriminator
         self.generator_optimizer = Adam(learning_rate=learning_rate)
         self.discriminator_optimizer = Adam(learning_rate=learning_rate)
 
         self.binary_cross_entropy = BinaryCrossentropy(from_logits=False)
         self.mean_squared_error = MeanSquaredError()
 
+        self.checkpoint = tf.train.Checkpoint(
+            step=tf.Variable(0),
+            generator=generator,
+            discriminator=discriminator,
+            generator_optimizer=self.generator_optimizer,
+            discriminator_optimizer=self.discriminator_optimizer,
+        )
+        self.checkpoint_manager = tf.train.CheckpointManager(
+            checkpoint=self.checkpoint,
+            directory=checkpoint_dir,
+            max_to_keep=3,
+        )
+        self._restore()
+
+    @property
+    def generator(self):
+        return self.checkpoint.generator
+
+    @property
+    def discriminator(self):
+        return self.checkpoint.discriminator
+
     def train(self, train_dataset, steps=200000):
         pls_metric = Mean()
         dls_metric = Mean()
-        step = 0
+        ckpt = self.checkpoint
+        ckpt_mgr = self.checkpoint_manager
 
-        for lr, hr in train_dataset.take(steps):
-            step += 1
+        for lr, hr in train_dataset.take(steps - ckpt.step.numpy()):
+            ckpt.step.assign_add(1)
+            step = ckpt.step.numpy()
 
             pl, dl = self.train_step(lr, hr)
+
+            if tf.math.is_nan(pl) or tf.math.is_nan(dl):
+                logger.warning(f'NaN loss detected at step {step}. Stopping GAN training.')
+                break
+
             pls_metric(pl)
             dls_metric(dl)
 
             if step % 50 == 0:
-                print(f'{step}/{steps}, perceptual loss = {pls_metric.result():.4f}, discriminator loss = {dls_metric.result():.4f}')
+                logger.info(f'{step}/{steps}, perceptual loss = {pls_metric.result():.4f}, '
+                            f'discriminator loss = {dls_metric.result():.4f}')
                 pls_metric.reset_states()
                 dls_metric.reset_states()
+                ckpt_mgr.save()
 
     @tf.function
     def train_step(self, lr, hr):
@@ -176,21 +224,21 @@ class SrganTrainer:
             lr = tf.cast(lr, tf.float32)
             hr = tf.cast(hr, tf.float32)
 
-            sr = self.generator(lr, training=True)
+            sr = self.checkpoint.generator(lr, training=True)
 
-            hr_output = self.discriminator(hr, training=True)
-            sr_output = self.discriminator(sr, training=True)
+            hr_output = self.checkpoint.discriminator(hr, training=True)
+            sr_output = self.checkpoint.discriminator(sr, training=True)
 
             con_loss = self._content_loss(hr, sr)
             gen_loss = self._generator_loss(sr_output)
-            perc_loss = con_loss + 0.001 * gen_loss
+            perc_loss = con_loss + _SRGAN_ADV_LOSS_WEIGHT * gen_loss
             disc_loss = self._discriminator_loss(hr_output, sr_output)
 
-        gradients_of_generator = gen_tape.gradient(perc_loss, self.generator.trainable_variables)
-        gradients_of_discriminator = disc_tape.gradient(disc_loss, self.discriminator.trainable_variables)
+        gradients_of_generator = gen_tape.gradient(perc_loss, self.checkpoint.generator.trainable_variables)
+        gradients_of_discriminator = disc_tape.gradient(disc_loss, self.checkpoint.discriminator.trainable_variables)
 
-        self.generator_optimizer.apply_gradients(zip(gradients_of_generator, self.generator.trainable_variables))
-        self.discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
+        self.generator_optimizer.apply_gradients(zip(gradients_of_generator, self.checkpoint.generator.trainable_variables))
+        self.discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, self.checkpoint.discriminator.trainable_variables))
 
         return perc_loss, disc_loss
 
@@ -198,8 +246,8 @@ class SrganTrainer:
     def _content_loss(self, hr, sr):
         sr = preprocess_input(sr)
         hr = preprocess_input(hr)
-        sr_features = self.vgg(sr) / 12.75
-        hr_features = self.vgg(hr) / 12.75
+        sr_features = self.vgg(sr) / _VGG_FEATURE_SCALE
+        hr_features = self.vgg(hr) / _VGG_FEATURE_SCALE
         return self.mean_squared_error(hr_features, sr_features)
 
     def _generator_loss(self, sr_out):
@@ -209,3 +257,8 @@ class SrganTrainer:
         hr_loss = self.binary_cross_entropy(tf.ones_like(hr_out), hr_out)
         sr_loss = self.binary_cross_entropy(tf.zeros_like(sr_out), sr_out)
         return hr_loss + sr_loss
+
+    def _restore(self):
+        if self.checkpoint_manager.latest_checkpoint:
+            self.checkpoint.restore(self.checkpoint_manager.latest_checkpoint)
+            logger.info(f'GAN restored from checkpoint at step {self.checkpoint.step.numpy()}.')

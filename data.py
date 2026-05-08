@@ -1,7 +1,12 @@
+import logging
 import os
 import tensorflow as tf
 
 from tensorflow.python.data.experimental import AUTOTUNE
+
+logger = logging.getLogger(__name__)
+
+_HR_CROP_SIZE = 96  # HR patch size for random crop (EDSR/WDSR paper default)
 
 
 class DIV2K:
@@ -141,9 +146,9 @@ class DIV2K:
 
     @staticmethod
     def _populate_cache(ds, cache_file):
-        print(f'Caching decoded images in {cache_file} ...')
+        logger.info(f'Caching decoded images in {cache_file} ...')
         for _ in ds: pass
-        print(f'Cached decoded images in {cache_file}.')
+        logger.info(f'Cached decoded images in {cache_file}.')
 
 
 # -----------------------------------------------------------
@@ -151,7 +156,7 @@ class DIV2K:
 # -----------------------------------------------------------
 
 
-def random_crop(lr_img, hr_img, hr_crop_size=96, scale=2):
+def random_crop(lr_img, hr_img, hr_crop_size=_HR_CROP_SIZE, scale=2):
     lr_crop_size = hr_crop_size // scale
     lr_img_shape = tf.shape(lr_img)[:2]
 
