@@ -2,3 +2,5 @@
 .div2k
 .ckpt
 
+__pycache__/
+*.pyc
