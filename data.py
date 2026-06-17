@@ -1,3 +1,4 @@
+import glob
 import logging
 import os
 import tensorflow as tf
@@ -183,6 +184,124 @@ def random_flip(lr_img, hr_img):
 def random_rotate(lr_img, hr_img):
     rn = tf.random.uniform(shape=(), maxval=4, dtype=tf.int32)
     return tf.image.rot90(lr_img, rn), tf.image.rot90(hr_img, rn)
+
+
+# -----------------------------------------------------------
+#  IO
+# -----------------------------------------------------------
+
+
+class CustomDataset:
+    """
+    Loads HR/LR image pairs from a directory prepared by prepare_dataset.py.
+
+    Expects the directory to contain 'hr/' and 'lr/' subdirectories with
+    matching filenames (as created by prepare_dataset.py).
+
+    Usage::
+
+        ds = CustomDataset('/path/to/dataset', scale=4)
+        train_ds = ds.dataset(batch_size=16, random_transform=True)
+    """
+
+    def __init__(self, dataset_dir: str, scale: int = 4):
+        self.scale = scale
+        self.hr_dir = os.path.join(dataset_dir, 'hr')
+        self.lr_dir = os.path.join(dataset_dir, 'lr')
+
+        if not os.path.isdir(self.hr_dir):
+            raise FileNotFoundError(f'HR directory not found: {self.hr_dir!r}')
+        if not os.path.isdir(self.lr_dir):
+            raise FileNotFoundError(f'LR directory not found: {self.lr_dir!r}')
+
+    def __len__(self):
+        return len(glob.glob(os.path.join(self.hr_dir, '*.png')))
+
+    def dataset(self, batch_size: int = 16, repeat_count=None,
+                random_transform: bool = True):
+        """Return a tf.data.Dataset of (lr, hr) uint8 image pairs."""
+        hr_files = sorted(glob.glob(os.path.join(self.hr_dir, '*.png')))
+        lr_files = sorted(glob.glob(os.path.join(self.lr_dir, '*.png')))
+
+        if not hr_files:
+            raise FileNotFoundError(f'No PNG images in {self.hr_dir!r}')
+
+        hr_ds = self._images_dataset(hr_files)
+        lr_ds = self._images_dataset(lr_files)
+
+        ds = tf.data.Dataset.zip((lr_ds, hr_ds))
+        if random_transform:
+            ds = ds.map(lambda lr, hr: random_crop(lr, hr, scale=self.scale),
+                        num_parallel_calls=AUTOTUNE)
+            ds = ds.map(random_rotate, num_parallel_calls=AUTOTUNE)
+            ds = ds.map(random_flip, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch_size)
+        ds = ds.repeat(repeat_count)
+        ds = ds.prefetch(buffer_size=AUTOTUNE)
+        return ds
+
+    @staticmethod
+    def _images_dataset(files):
+        ds = tf.data.Dataset.from_tensor_slices(files)
+        ds = ds.map(tf.io.read_file)
+        ds = ds.map(lambda x: tf.image.decode_png(x, channels=3),
+                    num_parallel_calls=AUTOTUNE)
+        return ds
+
+
+class OnTheFlyDataset:
+    """
+    Generates LR images on-the-fly from an HR image directory using TF bicubic
+    resize. No pre-processing step required — just point at a folder of images.
+
+    Usage::
+
+        ds = OnTheFlyDataset('/path/to/hr_images', scale=4)
+        train_ds = ds.dataset(batch_size=16)
+    """
+
+    def __init__(self, hr_dir: str, scale: int = 4):
+        self.scale = scale
+        self.hr_dir = hr_dir
+
+        if not os.path.isdir(hr_dir):
+            raise FileNotFoundError(f'HR directory not found: {hr_dir!r}')
+
+    def __len__(self):
+        return len(glob.glob(os.path.join(self.hr_dir, '*.png')))
+
+    def dataset(self, batch_size: int = 16, repeat_count=None,
+                random_transform: bool = True):
+        """Return a tf.data.Dataset of (lr, hr) uint8 image pairs."""
+        hr_files = sorted(glob.glob(os.path.join(self.hr_dir, '*.png')))
+
+        if not hr_files:
+            raise FileNotFoundError(f'No PNG images in {self.hr_dir!r}')
+
+        hr_ds = tf.data.Dataset.from_tensor_slices(hr_files)
+        hr_ds = hr_ds.map(tf.io.read_file)
+        hr_ds = hr_ds.map(lambda x: tf.image.decode_png(x, channels=3),
+                          num_parallel_calls=AUTOTUNE)
+
+        scale = self.scale
+
+        def _make_lr(hr):
+            h = tf.shape(hr)[0]
+            w = tf.shape(hr)[1]
+            lr = tf.image.resize(hr, [h // scale, w // scale], method='bicubic')
+            lr = tf.cast(tf.clip_by_value(tf.round(lr), 0, 255), tf.uint8)
+            return lr, hr
+
+        ds = hr_ds.map(_make_lr, num_parallel_calls=AUTOTUNE)
+        if random_transform:
+            ds = ds.map(lambda lr, hr: random_crop(lr, hr, scale=self.scale),
+                        num_parallel_calls=AUTOTUNE)
+            ds = ds.map(random_rotate, num_parallel_calls=AUTOTUNE)
+            ds = ds.map(random_flip, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch_size)
+        ds = ds.repeat(repeat_count)
+        ds = ds.prefetch(buffer_size=AUTOTUNE)
+        return ds
 
 
 # -----------------------------------------------------------
